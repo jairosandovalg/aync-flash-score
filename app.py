@@ -6,7 +6,7 @@ from playwright.async_api import async_playwright
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8923959866:AAES1dc4LAsedUKUsGR4p5D1SkaMt7nKyes")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7272170952")
-CONCURRENCIA_MAXIMA = 5  # Número de partidos escaneados en paralelo
+CONCURRENCIA_MAXIMA = 3  # Recomendado 3 o 4 para evitar throttling en Flashscore
 
 
 async def enviar_alerta_telegram_async(session: aiohttp.ClientSession, mensaje: str) -> bool:
@@ -22,6 +22,8 @@ async def enviar_alerta_telegram_async(session: aiohttp.ClientSession, mensaje: 
 
 def parsear_bloque_estadisticas(soup_bloque) -> dict:
     stats = {}
+
+    # 1. Filas métricas estándar
     for fila in soup_bloque.select('div[data-testid="wcl-statistics"]'):
         etiqueta_el = fila.select_one(".wcl-label_sO4bA span, [data-testid='wcl-scores-simple-text-01'], .wcl-name_2lXWg")
         if not etiqueta_el:
@@ -32,6 +34,7 @@ def parsear_bloque_estadisticas(soup_bloque) -> dict:
         stats[f"{nombre} (L)"] = val_l.get_text(strip=True) if val_l else "-"
         stats[f"{nombre} (V)"] = val_v.get_text(strip=True) if val_v else "-"
 
+    # 2. Remates fuera y a puerta
     shot_container = soup_bloque.select_one('[class*="shotOnTargetStats_"]')
     if shot_container:
         for selector in ['[class*="offTargetBar_"]', '[class*="onTargetBar_"]']:
@@ -44,12 +47,20 @@ def parsear_bloque_estadisticas(soup_bloque) -> dict:
                     stats[f"{nombre} (L)"] = vals[0].get_text(strip=True) if len(vals) > 0 else "-"
                     stats[f"{nombre} (V)"] = vals[-1].get_text(strip=True) if len(vals) > 1 else "-"
 
+    # 3. Badges SVG
     for badge in soup_bloque.select('[class*="incidentValueBadge_"]'):
         svg = badge.select_one("svg")
         if not svg:
             continue
         test_id = svg.get("data-testid", "").lower()
-        tipo = "Córneres" if "corner" in test_id else "Tarjetas amarillas" if "yellow" in test_id else "Tarjetas rojas" if "red" in test_id else None
+        tipo = None
+        if "corner" in test_id:
+            tipo = "Córneres"
+        elif "yellow-card" in test_id or "yellow" in test_id:
+            tipo = "Tarjetas amarillas"
+        elif "red-card" in test_id or "red" in test_id:
+            tipo = "Tarjetas rojas"
+
         if tipo:
             spans = [s.get_text(strip=True) for s in badge.select("span") if s.get_text(strip=True)]
             stats[f"{tipo} (L)"] = spans[0] if len(spans) >= 1 else "-"
@@ -60,7 +71,14 @@ def parsear_bloque_estadisticas(soup_bloque) -> dict:
 
 def formatear_mensaje_partido(reg: dict) -> str:
     stats = reg.get("Stats", {})
-    metricas_fijas = ["Posesión de balón", "Goles esperados (xG)", "Remates a puerta", "Remates fuera", "Córneres", "Tarjetas amarillas"]
+    metricas_fijas = [
+        "Posesión de balón",
+        "Goles esperados (xG)",
+        "Remates a puerta",
+        "Remates fuera",
+        "Córneres",
+        "Tarjetas amarillas"
+    ]
     lineas = []
     procesadas = set()
 
@@ -70,6 +88,14 @@ def formatear_mensaje_partido(reg: dict) -> str:
         lineas.append(f"• <b>{m}:</b> {stats.get(kl, '-') if kl else '-'} | {stats.get(kv, '-') if kv else '-'}")
         if kl: procesadas.add(kl.replace(" (L)", ""))
         if kv: procesadas.add(kv.replace(" (V)", ""))
+
+    for k, v in stats.items():
+        base_name = k.replace(" (L)", "").replace(" (V)", "")
+        if base_name not in procesadas and not any(f.lower() in base_name.lower() for f in metricas_fijas):
+            val_l = stats.get(f"{base_name} (L)", "-")
+            val_v = stats.get(f"{base_name} (V)", "-")
+            lineas.append(f"• <b>{base_name}:</b> {val_l} | {val_v}")
+            procesadas.add(base_name)
 
     stats_texto = "\n\n📊 <b>Estadísticas Principales (L | V):</b>\n" + "\n".join(lineas)
     return (
@@ -82,12 +108,20 @@ def formatear_mensaje_partido(reg: dict) -> str:
     )
 
 
-async def bloquear_recursos_pesados(route):
-    """Bloquea imágenes, tipografías y multimedia para acelerar la carga en un 70%."""
-    if route.request.resource_type in ["image", "font", "media"]:
-        await route.abort()
-    else:
-        await route.continue_()
+def cumple_criterios_alerta(partido: dict) -> bool:
+    estado = partido.get("Tiempo/Estado", "").upper()
+    estados_excluidos = ["FINALIZADO", "FIN", "FT", "APL.", "POSTP."]
+    if any(ex in estado for ex in estados_excluidos):
+        return False
+
+    marcador = partido.get("Marcador", "")
+    if not marcador or marcador == "- - -":
+        return False
+
+    if not partido.get("Stats") and partido.get("Cuotas") == "- - -":
+        return False
+
+    return True
 
 
 async def procesar_partido(context, p_div_data: dict, semaforo: asyncio.Semaphore, tg_session: aiohttp.ClientSession):
@@ -104,19 +138,23 @@ async def procesar_partido(context, p_div_data: dict, semaforo: asyncio.Semaphor
         }
         try:
             page = await context.new_page()
-            # Interceptar y descartar imágenes y recursos prescindibles
-            await page.route("**/*", bloquear_recursos_pesados)
+            await page.goto(url_partido, timeout=30000, wait_until="domcontentloaded")
 
-            await page.goto(url_partido, timeout=20000, wait_until="domcontentloaded")
-
-            # Espera corta al contenedor de marcador
+            # 1. Espera de cabecera y marcador
             try:
-                await page.wait_for_selector("div.detailScore__wrapper", timeout=4000)
+                await page.wait_for_selector("div.detailScore__wrapper", timeout=6000)
+            except Exception:
+                pass
+
+            # 2. Espera explícita para cuotas
+            try:
+                await page.wait_for_selector("button[data-analytics-bookmaker-id], [data-testid='wcl-oddsValue']", timeout=4000)
+                await page.wait_for_timeout(800)
             except Exception:
                 pass
 
             soup_resumen = BeautifulSoup(await page.content(), "html.parser")
-            
+
             score = soup_resumen.select_one("div.detailScore__wrapper")
             if score:
                 datos_partido["Marcador"] = score.get_text(separator=" ", strip=True)
@@ -130,30 +168,53 @@ async def procesar_partido(context, p_div_data: dict, semaforo: asyncio.Semaphor
                 datos_partido["Minuto"] = minuto.get_text(strip=True)
 
             botones = soup_resumen.find_all("button", attrs={"data-analytics-bookmaker-id": True})
-            cuotas = [b.find("span", {"data-testid": "wcl-oddsValue"}).get_text(strip=True) 
-                      for b in botones if b.find("span", {"data-testid": "wcl-oddsValue"})]
-            if len(cuotas) >= 3:
-                datos_partido["Cuotas"] = f"1: {cuotas[0]} | X: {cuotas[1]} | 2: {cuotas[2]}"
+            valores_cuotas = []
+            for btn in botones:
+                span = btn.find("span", {"data-testid": "wcl-oddsValue"})
+                if span and span.get_text(strip=True):
+                    valores_cuotas.append(span.get_text(strip=True))
+                if len(valores_cuotas) == 3:
+                    break
 
-            # Ir a Estadísticas
-            tab_stats = page.locator('a[data-analytics-alias="match-statistics"], a:has-text("ESTADÍSTICAS")').first
+            if len(valores_cuotas) >= 3:
+                datos_partido["Cuotas"] = f"1: {valores_cuotas[0]} | X: {valores_cuotas[1]} | 2: {valores_cuotas[2]}"
+
+            # 3. Pestaña Estadísticas
+            tab_stats = page.locator('a[data-analytics-alias="match-statistics"], a:has-text("ESTADÍSTICAS"), button:has-text("ESTADÍSTICAS")').first
             if await tab_stats.count() > 0:
-                await tab_stats.click(force=True)
                 try:
-                    await page.wait_for_selector('div[data-testid="statGroup"]', timeout=3500)
+                    await tab_stats.click(force=True)
+                    await page.wait_for_timeout(1000)
                 except Exception:
                     pass
 
-                soup_stats = BeautifulSoup(await page.content(), "html.parser")
-                bloque = soup_stats.select_one('div[data-testid="statGroup"]')
-                if bloque:
-                    datos_partido["Stats"] = parsear_bloque_estadisticas(bloque)
+                try:
+                    await page.wait_for_selector('div[data-testid="statGroup"]', timeout=6000)
+                except Exception:
+                    await page.wait_for_timeout(1200)
 
-            # Enviar alerta si aplica
-            if datos_partido["Marcador"] != "- - -":
+                soup_stats = BeautifulSoup(await page.content(), "html.parser")
+                bloque_principal = None
+
+                for grupo in soup_stats.select('div[data-testid="statGroup"]'):
+                    cabecera = grupo.select_one('[data-testid="wcl-headerSection-text"], [class*="header"]')
+                    if cabecera and "principal" in cabecera.get_text(strip=True).lower():
+                        bloque_principal = grupo
+                        break
+
+                if not bloque_principal:
+                    bloque_principal = soup_stats.select_one('div[data-testid="statGroup"]')
+
+                if bloque_principal:
+                    datos_partido["Stats"] = parsear_bloque_estadisticas(bloque_principal)
+
+            # Envío de alerta si cumple filtros
+            if cumple_criterios_alerta(datos_partido):
                 msg = formatear_mensaje_partido(datos_partido)
                 await enviar_alerta_telegram_async(tg_session, msg)
                 print(f"✓ Enviado: {p_div_data['nombre']}")
+            else:
+                print(f"Descartado: {p_div_data['nombre']}")
 
         except Exception as e:
             print(f"Error en {p_div_data['nombre']}: {e}")
@@ -163,7 +224,7 @@ async def procesar_partido(context, p_div_data: dict, semaforo: asyncio.Semaphor
 
 
 async def ejecutar_escaneo_async():
-    print("Iniciando escaneo rápido...")
+    print("Iniciando escaneo asíncrono...")
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -177,15 +238,15 @@ async def ejecutar_escaneo_async():
         try:
             await main.goto("https://www.flashscore.pe/", timeout=35000, wait_until="domcontentloaded")
             btn_live = "//div[contains(@class, 'filters__text') and text()='EN DIRECTO']"
-            await main.wait_for_selector(btn_live, timeout=12000)
+            await main.wait_for_selector(btn_live, timeout=15000)
             await main.locator(btn_live).click()
-            await main.wait_for_timeout(2000)
+            await main.wait_for_timeout(3000)
 
             soup = BeautifulSoup(await main.content(), "html.parser")
             partidos_divs = soup.find_all("div", id=lambda x: x and x.startswith("g_1_"))
 
             partidos_data = []
-            for p_div in partidos_divs[:30]:
+            for p_div in partidos_divs:
                 id_p = p_div.get('id').split('_')[-1]
                 h = p_div.find("div", class_=lambda c: c and "home" in c.lower() and "participant" in c.lower())
                 a = p_div.find("div", class_=lambda c: c and "away" in c.lower() and "participant" in c.lower())
@@ -196,7 +257,6 @@ async def ejecutar_escaneo_async():
 
             await main.close()
 
-            # Procesamiento paralelo controlado por semáforo
             semaforo = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
             async with aiohttp.ClientSession() as tg_session:
                 tareas = [procesar_partido(context, p_data, semaforo, tg_session) for p_data in partidos_data]
