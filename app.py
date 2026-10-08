@@ -178,7 +178,7 @@ async def procesar_partido(context, p_div_data: dict, semaforo: asyncio.Semaphor
                 datos_partido["Minuto"] = minuto.get_text(strip=True)
 
             # Extraer cuotas 1X2
-            botones = soup_resumen.find_all("button", attrs={"data-analytics-bookmaker-id": True})
+            botones = soup_resumen.find_all("button", attrs={"data-analytics-bookmaker-id": "660"})
             valores_cuotas = []
             for btn in botones:
                 span = btn.find("span", {"data-testid": "wcl-oddsValue"})
