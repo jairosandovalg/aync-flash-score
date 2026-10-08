@@ -127,9 +127,9 @@ def cumple_criterios_alerta(partido: dict) -> bool:
 
 
     # Exigir que existan cuotas válidas (descarta si no se encontraron o son vacías)
-    cuotas = partido.get("Cuotas", "")
-    if not cuotas or cuotas == "- - -":
-        return False
+    #cuotas = partido.get("Cuotas", "")
+    #if not cuotas or cuotas == "- - -":
+        #return False
 
     return True
 
